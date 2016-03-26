@@ -132,12 +132,12 @@ def _fill_aur_info(context, packages):
 
 
 def fill_aur_info(context, packages):
+    packages = set(packages)
     while True:
-        new_packages = set(p for p in packages if p._aur_info is None)
-        new_packages |= set(sum((p.aur_depends(True) +
-                                 p.aur_make_depends(True) for p in
-                                 packages if p._aur_info is not None), []))
-        packages = new_packages
+        packages |= set(sum((p.aur_depends(True) +
+                             p.aur_make_depends(True) for p in
+                             packages if p._aur_info is not None), []))
+        packages = set(p for p in packages if p._aur_info is None)
         if not packages:
             return
         
@@ -341,6 +341,11 @@ class Package:
 
         self.build(force)
 
+        if self.installed:
+            return
+
+        self.installed = True
+
         installed_package = self.context.local_db().get_pkg(self.name)
         if not self.built and installed_package and \
                 installed_package.version == self.version():
@@ -358,10 +363,14 @@ class Package:
                           installed_package.version, self.version())
         else:
             _log.info("Installing %s %s", self.name, self.version())
-        cmd = ["makepkg", "-i", "-p", ".PKGBUILD"]
+        cmd = ["makepkg", "--noconfirm", "-i", "-p", ".PKGBUILD"]
         if not self.explicit:
             cmd.append("--asdeps")
         check_call_user(cmd, cwd=self._directory())
+
+
+    def __hash__(self):
+        return hash(self.name)
 
 
 class ColorFormatter(logging.Formatter):
