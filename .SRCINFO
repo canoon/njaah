@@ -1,0 +1,18 @@
+pkgbase = njaah
+	pkgdesc = An AUR helper based on git submodules
+	pkgver = 1
+	pkgrel = 1
+	url = https://github.com/canoon/njaah
+	arch = any
+	license = MIT
+	depends = pyalpm
+	depends = python-requests
+	depends = python-termcolor
+	depends = git
+	source = njaah
+	source = README.md
+	md5sums = SKIP
+	md5sums = SKIP
+
+pkgname = njaah
+

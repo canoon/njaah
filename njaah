@@ -1,0 +1,458 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import os.path
+import subprocess
+import logging
+import pyalpm
+import shutil
+import sys
+import shlex
+import re
+import requests
+import platform
+from termcolor import colored
+from pycman import config
+from collections import defaultdict
+
+directory = os.path.expanduser("~/aur-build")
+TRACE = 1 
+
+_log = logging.getLogger("njah.main")
+
+
+def init_repo():
+    if not os.path.exists(directory):
+        subprocess.check_call(["git", "init", directory])
+
+
+def aur_url(package):
+    return "https://aur.archlinux.org/%s.git" % package
+
+
+class UserError(Exception):
+    pass
+
+
+def parse_dependency(dependency):
+    return re.split("[<>=]", dependency)[0]
+
+
+class Context:
+    def __init__(self, alpm):
+        self.packages = {}
+        self.alpm = alpm
+        self._local_db = None
+        self.session = requests.Session()
+
+
+    def package(self, package):
+        if package not in self.packages:
+            self.packages[package] = Package(package, self)
+        return self.packages[package]
+
+
+    def foreign_package_list(self):
+        if "_foreign_data" not in self.__dict__:
+            _foreign = self._foreign_package_list_uncached()
+        return _foreign
+
+
+    def local_db(self):
+        if not self._local_db:
+            self._local_db = self.alpm.get_localdb()
+        return self._local_db
+
+    def _foreign_package_list_uncached(self):
+        res = set()
+        for repo in self.alpm.get_syncdbs():
+            res |= set(p.name for p in repo.pkgcache)
+            res |= set(sum(([parse_dependency(x) for x in p.provides] for p in repo.pkgcache), []))
+        return res
+
+
+def _parse_srcinfo(content):
+    res = defaultdict(list)
+    for x in content.split("\n"):
+        if x.strip() and not x.strip().startswith("#"):
+            k, v = x.split("=", 1)
+            res[k.strip()].append(v.strip())
+    return res
+
+
+def check_call_user(args, cwd=None, output=False, **kwargs):
+    cmd_string = " ".join(shlex.quote(x) for x in args)
+    if not output:
+    	_log.debug("Running \"%s\" in %s", cmd_string, cwd or os.getcwd())
+    p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE if output else None, **kwargs)
+    stdout, stderr = p.communicate()
+    if p.returncode != 0:
+        raise UserError("\"%s\" returned %s, wd: %s" %
+		        (cmd_string,
+		         p.returncode, 
+                         cwd or os.getcwd()))
+       
+    return stdout
+
+
+def fail_once(prefix):
+    def wrap(func):
+        def wrapped(package, *args, **kwargs):
+            if func in package.errors:
+                raise package.errors[func]
+            try:
+                func(package)
+            except UserError as e:
+                new_err = UserError(prefix % package.name + ": " + str(e))
+                package.errors[func] = new_err
+                raise new_err
+        return wrapped
+    return wrap
+
+def _fill_aur_info(context, packages):
+    _log.info("Updating AUR info for packages: %s", ", ".join(p.name for p in packages))
+    r = context.session.get("https://aur.archlinux.org/rpc/?v=5&type=info&" +
+                            "&".join("arg[]=" + p.name for p in packages))
+    r.raise_for_status()
+    d = r.json()
+    if d['type'] == 'error':
+        raise RuntimeError("AUR: %s" % d)
+    assert d['type'] == 'multiinfo'
+    for i in d['results']:
+        pkg = context.package(i["PackageBase"])
+        pkg._aur_info = i
+        context.package(i["Name"]).base = pkg
+
+    for i in packages:
+        if i._aur_info is None:
+            if i.base._aur_info is None:
+                _log.warn("Package %s does not exist in AUR database", i.base.name)
+            i._aur_info = False
+
+
+def fill_aur_info(context, packages):
+    while True:
+        new_packages = set(p for p in packages if p._aur_info is None)
+        new_packages |= set(sum((p.aur_depends(True) +
+                                 p.aur_make_depends(True) for p in
+                                 packages if p._aur_info is not None), []))
+        packages = new_packages
+        if not packages:
+            return
+        
+        _fill_aur_info(context, packages)
+ 
+
+class Package:
+    def __init__(self, name, context):
+        self.context = context
+        self.name = name
+        self.downloaded = False
+        self.built = False
+        self.installed = False
+        self.explicit = False
+        self._srcinfo = None
+        self.updated_source_info = False
+        self.errors = {}
+        self._aur_info = None
+        self.base = self
+
+
+    def aur_info(self):
+        if self._aur_info is None:
+            fill_aur_info([self])
+        return self._aur_info
+
+
+    def _directory(self):
+        return os.path.join(directory, self.name)
+
+
+    def make_explicit(self):
+        self.explicit = True
+
+
+    def srcinfo(self):
+        if not self._srcinfo:
+            self._srcinfo = self._srcinfo_repo()
+        return self._srcinfo
+
+
+    def _srcinfo_repo(self):
+        with open(os.path.join(self._directory(), ".SRCINFO"), encoding="utf-8") as f:
+            return _parse_srcinfo(f.read())
+
+
+    def _update_srcinfo(self):
+        if self.updated_source_info:
+            return False
+        self.updated_source_info = True
+        source_info = check_call_user(["makepkg", "--printsrcinfo", "-p", ".PKGBUILD"], cwd=self._directory(), output=True)
+        self._srcinfo = _parse_srcinfo(source_info.decode("utf-8"))
+
+
+    def _sources(self):
+        sources = self.srcinfo()['source'] + self.srcinfo()['source_' + platform.machine()]
+        parsed = []
+        for source in sources:
+            if "::" in source:
+               local, remote = source.split("::", 1)
+            elif "/" in source:
+               local = os.path.basename(source)
+               local = re.sub("\\.(git|hg)$", '', local)
+               remote = source
+            else:
+               local = source
+               remote = None
+            parsed.append((local, remote))
+        return parsed
+
+
+    def _stater(self, files, agg):
+        return agg(os.stat(os.path.join(self._directory(), f)).st_mtime for f in files)
+
+
+    def _latest_source_time(self):
+        local_sources = [l for l, r in self._sources() if not r]
+        return self._stater(local_sources + [".SRCINFO", "PKGBUILD"], max)
+
+
+    def _packages(self):
+        return list(x for x in os.listdir(self._directory()) if x.endswith(".pkg.tar.xz"))
+
+
+    def needs_build(self):
+        packages = self._packages()
+        if not packages:
+            return True
+        return self._stater(packages, min) < self._latest_source_time()
+
+
+    def aur_depends(self, aur_info=False, make=False):
+        if aur_info:
+            if not self.aur_info():
+                return []
+            if make:
+                raw = self.aur_info().get('MakeDepends', [])
+            else:
+                raw = self.aur_info().get('Depends', [])
+        else:
+            if make:
+                raw = self.srcinfo()['depends']
+            else:
+                raw = self.srcinfo()['makedepends']
+        all_deps = (parse_dependency(x) for x in raw)
+        aur_deps = (x for x in all_deps if x not in self.context.foreign_package_list())
+        return [self.context.package(x) for x in aur_deps]
+
+
+    def aur_make_depends(self, aur_info=False):
+        return self.aur_depends(aur_info, True)
+
+
+    def version(self):
+        return self.srcinfo()["pkgver"][0] + "-" + self.srcinfo()["pkgrel"][0]
+
+
+    def download(self):
+        self.base._download()
+
+
+    @fail_once("Failed to download %s")
+    def _download(self):
+        if self.downloaded:
+            return
+        self.downloaded = True
+        if not os.path.exists(self._directory()):
+            _log.info("Downloading %s", self.name)
+            if not self.aur_info():
+                raise UserError("Could not find package %s" % self.name)
+            try:
+                check_call_user(["git", "submodule", "add", aur_url(self.name)], cwd=directory)
+            except subprocess.CalledProcessError:
+                if os.path.exists(self._directory()):
+                    shutil.rmtree(os.path.join(directory, ".git", "modules", self.name))
+                    shutil.rmtree(self._directory())
+                raise
+        else:
+            _log.info("Updating %s", self.name)
+            check_call_user(["git", "pull"], cwd=self._directory())
+
+        exclude_file = os.path.join(directory, ".git", "modules", self.name, "info", "exclude")
+        with open(exclude_file, "w", encoding="utf-8") as f:
+             f.write("*.pkg.tar.xz\n")
+             f.write("src/\n")
+             f.write("pkg/\n")
+             f.write(".PKGBUILD\n")
+             for source in (x[0] for x in self._sources() if x[1] != None):
+                 f.write(source + "\n")
+
+        _log.info("Updating dependencies for %s", self.name)
+        for dependency in self.aur_make_depends() + self.aur_depends():
+            dependency.download()
+
+
+    @fail_once("Failed to build %s")
+    def build(self, force=False):
+        if self != self.base:
+            return self.base.build()
+
+        if not os.path.exists(self._directory()):
+            raise UserError("Package %s has not been downloaded" %
+                            self.name)
+        if self.built:
+            return
+        shutil.copyfile(os.path.join(self._directory(), "PKGBUILD"),
+                        os.path.join(self._directory(), ".PKGBUILD"))
+        self._update_srcinfo()
+        if not force and not self.needs_build():
+            _log.log(TRACE, "Not building %s, as it's up to date", self.name)
+            return
+
+        self.built = True
+        for package in self._packages():
+            os.unlink(os.path.join(self._directory(), package))
+
+        _log.info("Installing make dependencies for %s", self.name)
+        for dependency in self.aur_make_depends():
+            dependency.install()
+
+        _log.info("Building %s", self.name)
+        check_call_user(["makepkg", "-sf", "-p", ".PKGBUILD"], cwd=self._directory())
+        self._update_srcinfo()
+
+
+    def architecture(self):
+        for i in self.srcinfo()["arch"]:
+            if i in ['any', platform.machine()]:
+                return i
+        raise UserError("Architecture %s not available for package %s, available architectures: %s" % 
+                        (platform.machine(), self.name, self.srcinfo()["arch"]))
+                
+    def package_name(self):
+        return self.name + "-" + self.version() + "-" + self.base.architecture() + ".pkg.tar.xz"
+
+
+    @fail_once("Failed to install %s")
+    def install(self, force=False):
+        if self != self.base:
+            return self.base.install()
+
+        self.build(force)
+
+        installed_package = self.context.local_db().get_pkg(self.name)
+        if not self.built and installed_package and \
+                installed_package.version == self.version():
+            _log.log(TRACE, "%s is already installed", self.name)
+            return
+
+        for dependency in self.aur_make_depends():
+            dependency.install()
+
+        if installed_package:
+            if installed_package.version == self.version():
+                _log.info("Reinstalling %s %s", self.name, self.version())
+            else:
+                _log.info("Upgrading %s from %s to %s", self.name,
+                          installed_package.version, self.version())
+        else:
+            _log.info("Installing %s %s", self.name, self.version())
+        cmd = ["makepkg", "-i", "-p", ".PKGBUILD"]
+        if not self.explicit:
+            cmd.append("--asdeps")
+        check_call_user(cmd, cwd=self._directory())
+
+
+class ColorFormatter(logging.Formatter):
+    def __init__(self):
+        super().__init__(self)
+        def nop(msg, *args, **kwargs):
+            return msg
+        if sys.stderr.isatty():
+            self.colored = colored
+        else:
+            self.colored = nop
+
+
+    def format(self, record):
+        if record.levelno >= logging.ERROR:
+            msg_color = "red"
+        elif record.levelno >= logging.WARN:
+            msg_color = "yellow"
+        else:
+            msg_color = "white"
+        return (self.colored("=>", "red") + " " +
+                self.colored(record.getMessage(), msg_color, 
+                             attrs=["bold"] if record.levelno > logging.DEBUG else []))
+
+
+def main():
+    parser = config.make_parser(description='AUR helper that uses git submodules to manage package state.')
+
+    parser.add_argument('packages', nargs='*',
+                        help='Packages to install/download (defaults to all local explicitly installed packages)')
+    parser.add_argument('-u', '--update', default=False, action='store_true',
+                        help='Download/Update packages')
+    parser.add_argument('--build', default=False, action='store_true',
+                        help='Build packages')
+    parser.add_argument('-i', '--install', default=False, action='store_true',
+                        help='Build/Install packages')
+
+
+    args = parser.parse_args()
+
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter())
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.DEBUG)
+
+    _log.info("Loading package info")
+    alpm = config.init_with_config_and_options(args)
+    init_repo()
+    context = Context(alpm)
+
+    if args.packages:
+        packages = args.packages
+    else:
+        localdb = alpm.get_localdb()
+        packages = [pkg.name for pkg in localdb.pkgcache
+                             if pkg.reason == pyalpm.PKG_REASON_EXPLICIT and
+                                pkg.name not in context.foreign_package_list()]
+
+    pkgs = list(context.package(p) for p in packages)
+    fill_aur_info(context, pkgs)
+    for p in pkgs:
+        p.make_explicit()
+
+    exit = 0
+    if args.update:
+        for package in pkgs:
+            try:
+                package.download()
+            except UserError as e:
+                exit = 1
+                _log.error(str(e))
+
+    if args.build:
+        for package in pkgs:
+            try:
+                package.build(force=bool(args.packages))
+            except UserError as e:
+                exit = 1
+                _log.error(str(e))
+    if args.install:
+        for package in pkgs:
+            try:
+                package.install(force=bool(args.packages))
+            except UserError as e:
+                exit = 1
+                _log.error(str(e))
+    
+    sys.exit(exit)
+
+
+if __name__ == "__main__":
+    main()
+        
