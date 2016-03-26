@@ -9,7 +9,7 @@ To get started run `njaah --update` which pulls down packages from
 AUR which defaults explicitly installed local packages.
 
 ```console
--> % njaah --update
+$ njaah --update
 => Loading package info
 Initialized empty Git repository in /home/user/aur-build/.git/
 => Updating AUR info for packages: cower, google-chrome, package-query, pacaur, ttf-opensans, b43-firmware, xf86-input-mtrack-git, yaourt, oh-my-zsh-git, tcptraceroute
@@ -60,7 +60,7 @@ Checking connectivity... done.
 Next you will want to review the packages in ~/aur-build
 
 ```console
--> % git status
+$ git status
 On branch master
 
 Initial commit
@@ -81,8 +81,8 @@ You may commit these changes but it's not required
 Finally we can build and install the packages with njaah --install
 
 
-```
--> % njaah --install
+```console
+$ njaah --install
 => Loading package info
 => Updating AUR info for packages: package-query, tcptraceroute, pacaur, cower, oh-my-zsh-git, google-chrome, xf86-input-mtrack-git, yaourt, b43-firmware, ttf-opensans
 => Starting new HTTPS connection (1): aur.archlinux.org
@@ -291,8 +291,8 @@ the AUR.
 
 
 ```console
--> % cd ~/aur-build/oh-my-zsh-git 
--> % git diff
+$ cd ~/aur-build/oh-my-zsh-git 
+$ git diff
 diff --git a/PKGBUILD b/PKGBUILD
 index 615e03d..cb884a1 100644
 --- a/PKGBUILD
@@ -309,7 +309,7 @@ index 615e03d..cb884a1 100644
  
    # Copy everything else.
    cp -r . "${pkgdir}/usr/share/oh-my-zsh/"
--> % njaah -i            
+$ njaah -i            
 => Loading package info
 => Updating AUR info for packages: b43-firmware, yaourt, oh-my-zsh-git, tcptraceroute, pacaur, xf86-input-mtrack-git, package-query, cower, ttf-opensans, google-chrome
 => Starting new HTTPS connection (1): aur.archlinux.org
